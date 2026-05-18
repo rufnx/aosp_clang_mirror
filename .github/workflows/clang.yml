@@ -13,7 +13,7 @@ on:
   workflow_dispatch:
     inputs:
       clang_version:
-        description: 'Clang version to download (e.g., clang-r450e, leave empty for latest)'
+        description: 'Clang version to download (e.g., clang-r547379, leave empty for latest)'
         required: false
         default: ''
       manual_mode:
@@ -26,7 +26,7 @@ on:
 
 jobs:
   update:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-slim
     env:
       AOSP_REPO: "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+/mirror-goog-main-llvm-toolchain-source"
       AOSP_ARCHIVE: "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/mirror-goog-main-llvm-toolchain-source"
