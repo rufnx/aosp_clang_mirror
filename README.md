@@ -23,7 +23,7 @@ trigger (cron/manual)
 ```
 
 ## Download
-- Go to [Github Release](https://github.com/bachnxuan/aosp_clang_mirror/releases/latest) and grab the `clang-r*.tar.gz` asset.
+- Go to [Github Release](https://github.com/rufnx/aosp_clang_mirror/releases/latest) and grab the `clang-r*.tar.gz` asset.
 
 ## Manual update
 - Trigger the `Update Clang Prebuilts` workflow from the Actions tab to force a refresh.
