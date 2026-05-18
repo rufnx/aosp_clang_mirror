@@ -11,12 +11,22 @@ permissions:
 
 on:
   workflow_dispatch:
+    inputs:
+      clang_version:
+        description: 'Clang version to download (e.g., clang-r450e, leave empty for latest)'
+        required: false
+        default: ''
+      manual_mode:
+        description: 'Enable manual mode'
+        required: false
+        type: boolean
+        default: false
   schedule:
     - cron: '0 */3 * * *'
 
 jobs:
   update:
-    runs-on: ubuntu-slim
+    runs-on: ubuntu-22.04
     env:
       AOSP_REPO: "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+/mirror-goog-main-llvm-toolchain-source"
       AOSP_ARCHIVE: "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/mirror-goog-main-llvm-toolchain-source"
@@ -29,9 +39,65 @@ jobs:
           fetch-tags: true
 
       - name: Install Dependencies
-        run: sudo apt update && sudo apt install -qq aria2 git jq
+        run: sudo apt update && sudo apt install -qq aria2 git jq curl
 
-      - name: Fetch latest Clang info
+      - name: Determine Mode
+        id: mode
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ github.event.inputs.manual_mode }}" == "true" && -n "${{ github.event.inputs.clang_version }}" ]]; then
+            echo "is_manual=true" >> "$GITHUB_OUTPUT"
+            echo "clang_version=${{ github.event.inputs.clang_version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_manual=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fetch Manual Clang info
+        if: steps.mode.outputs.is_manual == 'true'
+        id: fetch-manual
+        run: |
+          # pipefail prevents continuing when curl fails inside the pipeline
+          set -euo pipefail
+
+          CURL_FLAGS=(
+            --retry 5
+            --retry-delay 5
+            --retry-all-errors
+            -fsSL
+          )
+
+          CLANG_VERSION_INPUT="${{ steps.mode.outputs.clang_version }}"
+          
+          # Validate format
+          if ! [[ "$CLANG_VERSION_INPUT" =~ ^clang-r[0-9]+[a-z]?$ ]]; then
+            echo "Invalid format! Use format like: clang-r450e, clang-r451, etc."
+            exit 1
+          fi
+
+          echo "Fetching info for $CLANG_VERSION_INPUT..."
+
+          # Check if version exists
+          if ! curl "${CURL_FLAGS[@]}" -f "${AOSP_REPO}/${CLANG_VERSION_INPUT}/" > /dev/null 2>&1; then
+            echo "Clang version $CLANG_VERSION_INPUT not found in AOSP repository"
+            exit 1
+          fi
+
+          BUILD_ID=$(curl "${CURL_FLAGS[@]}" \
+            "${AOSP_REPO}/${CLANG_VERSION_INPUT}/BUILD_INFO?format=TEXT" \
+            | base64 -d \
+            | jq -r .bid)
+          CLANG_VERSION=$(curl "${CURL_FLAGS[@]}" \
+            "${AOSP_REPO}/${CLANG_VERSION_INPUT}/AndroidVersion.txt?format=TEXT" \
+            | base64 -d \
+            | head -n1)
+
+          echo "latest_clang=$CLANG_VERSION_INPUT" >> "$GITHUB_OUTPUT"
+          echo "build_id=$BUILD_ID" >> "$GITHUB_OUTPUT"
+          echo "clang_version=$CLANG_VERSION" >> "$GITHUB_OUTPUT"
+          echo "new_tag=${CLANG_VERSION_INPUT}-${BUILD_ID}" >> "$GITHUB_OUTPUT"
+          echo "Successfully fetched info for $CLANG_VERSION_INPUT"
+
+      - name: Fetch Latest Clang info
+        if: steps.mode.outputs.is_manual == 'false'
         id: fetch-latest
         run: |
           # pipefail prevents continuing when curl fails inside the pipeline
@@ -44,11 +110,19 @@ jobs:
             -fsSL
           )
 
+          echo "Fetching latest Clang version..."
+
           LATEST_CLANG=$(curl "${CURL_FLAGS[@]}" "$AOSP_REPO" \
             | grep -oP 'href="[^"]*clang-r[0-9]+[a-z]?/' \
             | grep -oP 'clang-r[0-9]+[a-z]?' \
             | sort -V \
             | tail -n1)
+          
+          if [ -z "$LATEST_CLANG" ]; then
+            echo "Failed to fetch latest Clang version"
+            exit 1
+          fi
+
           BUILD_ID=$(curl "${CURL_FLAGS[@]}" \
             "${AOSP_REPO}/${LATEST_CLANG}/BUILD_INFO?format=TEXT" \
             | base64 -d \
@@ -62,42 +136,70 @@ jobs:
           echo "build_id=$BUILD_ID" >> "$GITHUB_OUTPUT"
           echo "clang_version=$CLANG_VERSION" >> "$GITHUB_OUTPUT"
           echo "new_tag=${LATEST_CLANG}-${BUILD_ID}" >> "$GITHUB_OUTPUT"
+          echo "Latest Clang version: $LATEST_CLANG"
+
+      - name: Consolidate outputs
+        id: clang-info
+        run: |
+          if [[ "${{ steps.mode.outputs.is_manual }}" == "true" ]]; then
+            echo "latest_clang=${{ steps.fetch-manual.outputs.latest_clang }}" >> "$GITHUB_OUTPUT"
+            echo "build_id=${{ steps.fetch-manual.outputs.build_id }}" >> "$GITHUB_OUTPUT"
+            echo "clang_version=${{ steps.fetch-manual.outputs.clang_version }}" >> "$GITHUB_OUTPUT"
+            echo "new_tag=${{ steps.fetch-manual.outputs.new_tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "latest_clang=${{ steps.fetch-latest.outputs.latest_clang }}" >> "$GITHUB_OUTPUT"
+            echo "build_id=${{ steps.fetch-latest.outputs.build_id }}" >> "$GITHUB_OUTPUT"
+            echo "clang_version=${{ steps.fetch-latest.outputs.clang_version }}" >> "$GITHUB_OUTPUT"
+            echo "new_tag=${{ steps.fetch-latest.outputs.new_tag }}" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Check if tag exists
         id: exists
         run: |
-          TAG="${{ steps.fetch-latest.outputs.new_tag }}"
+          TAG="${{ steps.clang-info.outputs.new_tag }}"
           if git tag --list "$TAG" | grep -q .; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Tag $TAG already exists"
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Tag $TAG is new"
           fi
 
       - name: Clang release exists
         if: steps.exists.outputs.exists == 'true'
-        run: echo "Latest Clang ${{ steps.fetch-latest.outputs.new_tag }} is already released."
+        run: echo "Clang ${{ steps.clang-info.outputs.new_tag }} is already released."
 
       - name: Download Clang
         if: steps.exists.outputs.exists == 'false'
         run: |
           WORKSPACE="toolchain"
-          FILE="${{ steps.fetch-latest.outputs.latest_clang }}.tar.gz"
-          URL="${AOSP_ARCHIVE}/${{ steps.fetch-latest.outputs.latest_clang }}.tar.gz?format=tar.gz"
+          FILE="${{ steps.clang-info.outputs.latest_clang }}.tar.gz"
+          URL="${AOSP_ARCHIVE}/${{ steps.clang-info.outputs.latest_clang }}.tar.gz?format=tar.gz"
           
           mkdir -p "$WORKSPACE"
 
+          echo "Downloading Clang from: $URL"
           curl -fL --retry 5 --retry-delay 5 --retry-all-errors -o "$WORKSPACE/$FILE" "$URL"
+          
+          if [ -f "$WORKSPACE/$FILE" ]; then
+            SIZE=$(du -h "$WORKSPACE/$FILE" | cut -f1)
+            echo "Downloaded successfully (Size: $SIZE)"
+          else
+            echo "Download failed"
+            exit 1
+          fi
 
       - name: Create release
         if: steps.exists.outputs.exists == 'false'
         uses: softprops/action-gh-release@v3.0.0
         with:
-          tag_name: ${{ steps.fetch-latest.outputs.new_tag }}
-          name: Clang prebuilts ${{ steps.fetch-latest.outputs.new_tag }}
-          files: toolchain/${{ steps.fetch-latest.outputs.latest_clang }}.tar.gz
+          tag_name: ${{ steps.clang-info.outputs.new_tag }}
+          name: Clang prebuilts ${{ steps.clang-info.outputs.new_tag }}
+          files: toolchain/${{ steps.clang-info.outputs.latest_clang }}.tar.gz
           generate_release_notes: false
           body: |
             Automated release asset
+            Mode: ${{ steps.mode.outputs.is_manual == 'true' && 'Manual' || 'Automatic' }}
 
       - name: Telegram Notify
         if: steps.exists.outputs.exists == 'false'
@@ -107,15 +209,22 @@ jobs:
           HOST: ${{ github.server_url }}
           REPO: ${{ github.repository }}
         run: |
+          # Check if Telegram secrets are configured
+          if [[ -z "$TG_CHAT_ID" || -z "$TG_BOT_TOKEN" ]]; then
+            echo "Telegram secrets not configured, skipping notification"
+            exit 0
+          fi
+
           # Context and inputs
           REPO_URL="${HOST}/${REPO}"
-          TAG_NAME="${{ steps.fetch-latest.outputs.latest_clang }}"
-          FULL_TAG="${{ steps.fetch-latest.outputs.new_tag }}"
-          CLANG_VERSION="${{ steps.fetch-latest.outputs.clang_version }}"
+          TAG_NAME="${{ steps.clang-info.outputs.latest_clang }}"
+          FULL_TAG="${{ steps.clang-info.outputs.new_tag }}"
+          CLANG_VERSION="${{ steps.clang-info.outputs.clang_version }}"
+          MODE="${{ steps.mode.outputs.is_manual == 'true' && 'Manual' || 'Automatic' }}"
 
           # Clang information
           ALT_VER="${TAG_NAME#clang-}"
-          BID="${{ steps.fetch-latest.outputs.build_id }}"
+          BID="${{ steps.clang-info.outputs.build_id }}"
 
           # Download links
           AOSP_TARBALL="${AOSP_ARCHIVE}/${TAG_NAME}.tar.gz?format=tar.gz"
@@ -124,6 +233,7 @@ jobs:
           MESSAGE=$(cat <<-EOF
           *Google Clang Prebuilt Update*
 
+          *Mode*: ${MODE}
           *Clang Version*: ${CLANG_VERSION} (${ALT_VER})
           *Build ID*: ${BID}
 
@@ -138,3 +248,5 @@ jobs:
             -d disable_web_page_preview=true \
             -d parse_mode=Markdown \
             --data-urlencode "text=${MESSAGE}"
+          
+          echo "Telegram notification sent"
